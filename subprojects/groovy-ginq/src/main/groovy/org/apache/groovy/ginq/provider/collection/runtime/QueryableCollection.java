@@ -24,7 +24,6 @@ import groovy.lang.Tuple2;
 import groovy.lang.Tuple3;
 import groovy.transform.Internal;
 import org.apache.groovy.internal.util.Supplier;
-import org.apache.groovy.util.SystemUtil;
 import org.codehaus.groovy.runtime.DefaultGroovyMethods;
 import org.codehaus.groovy.runtime.dgmimpl.NumberNumberMinus;
 import org.codehaus.groovy.runtime.typehandling.NumberMath;
@@ -116,42 +115,57 @@ class QueryableCollection<T> implements Queryable<T>, Serializable {
 
     @Override
     public <U> Queryable<Tuple2<T, U>> innerHashJoin(Queryable<? extends U> queryable, Function<? super T, ?> fieldsExtractor1, Function<? super U, ?> fieldsExtractor2) {
-        final ConcurrentObjectHolder<Map<Integer, List<U>>> hashTableHolder = new ConcurrentObjectHolder<>();
-        final Supplier<Map<Integer, List<U>>> hashTableSupplier = createHashTableSupplier(queryable, fieldsExtractor2);
+        final ConcurrentObjectHolder<Map<Integer, List<Candidate<U>>>> hashTableHolder = new ConcurrentObjectHolder<>();
+        final Supplier<Map<Integer, List<Candidate<U>>>> hashTableSupplier = createHashTableSupplier(queryable, fieldsExtractor2);
         Stream<Tuple2<T, U>> stream = this.stream().flatMap(p -> {
             // build hash table
-            Map<Integer, List<U>> hashTable = buildHashTable(hashTableHolder, hashTableSupplier);
+            Map<Integer, List<Candidate<U>>> hashTable = buildHashTable(hashTableHolder, hashTableSupplier);
 
             // probe the hash table
-            return probeHashTable(hashTable, p, fieldsExtractor1, fieldsExtractor2);
+            return probeHashTable(hashTable, p, fieldsExtractor1);
         });
 
         return from(stream);
     }
 
-    private static <U> Supplier<Map<Integer, List<U>>> createHashTableSupplier(Queryable<? extends U> queryable, Function<? super U, ?> fieldsExtractor2) {
+    private static final class Bucket<E> extends ArrayList<E> {
+        private static final long serialVersionUID = 2813676753531316403L;
+        Bucket(int initialCapacity) {
+            super(initialCapacity);
+        }
+        static <E> Bucket<E> singletonBucket(E o) {
+            Bucket<E> bucket = new Bucket<>(1);
+            bucket.add(o);
+            return bucket;
+        }
+    }
+
+    private static class Candidate<U> {
+        private final U original;
+        private final Object extracted;
+
+        private Candidate(U original, Object extracted) {
+            this.original = original;
+            this.extracted = extracted;
+        }
+    }
+
+    private static <U> Supplier<Map<Integer, List<Candidate<U>>>> createHashTableSupplier(Queryable<? extends U> queryable, Function<? super U, ?> fieldsExtractor2) {
         return () -> queryable.stream()
+                .map(e -> new Candidate<U>(e, fieldsExtractor2.apply(e)))
                 .collect(
                         Collectors.toMap(
-                                c -> hash(fieldsExtractor2.apply(c)),
-                                Collections::singletonList,
-                                (oldList, newList) -> {
-                                    if (!(oldList instanceof ArrayList)) {
-                                        List<U> tmpList = new ArrayList<>(HASHTABLE_BUCKET_INITIAL_SIZE);
-                                        tmpList.addAll(oldList);
-                                        oldList = tmpList;
-                                    }
-
-                                    oldList.addAll(newList);
-                                    return oldList;
+                                c -> hash(c.extracted),
+                                Bucket::singletonBucket,
+                                (oldBucket, newBucket) -> {
+                                    oldBucket.addAll(newBucket);
+                                    return oldBucket;
                                 }
                         ));
     }
 
-    private static final int HASHTABLE_MAX_SIZE = SystemUtil.getIntegerSafe("groovy.ginq.hashtable.max.size", 128);
-    private static final int HASHTABLE_BUCKET_INITIAL_SIZE = SystemUtil.getIntegerSafe("groovy.ginq.hashtable.bucket.initial.size", 16);
     private static Integer hash(Object obj) {
-        return Objects.hash(obj) % HASHTABLE_MAX_SIZE; // mod `HASHTABLE_MAX_SIZE` to limit the size of hash table
+        return Objects.hash(obj);
     }
 
     @Override
@@ -289,7 +303,7 @@ class QueryableCollection<T> implements Queryable<T>, Serializable {
         if (this instanceof Group) {
             this.makeReusable();
             if (0 == this.count()) {
-                stream = Stream.of((T) tuple(Collections.emptyMap(), EMPTY_QUERYABLE)).map((T t) -> mapper.apply(t, this));
+                stream = Stream.of((T) tuple(NULL, EMPTY_QUERYABLE)).map((T t) -> mapper.apply(t, this));
             }
         }
         if (null == stream) {
@@ -299,10 +313,14 @@ class QueryableCollection<T> implements Queryable<T>, Serializable {
         if (TRUE_STR.equals(originalParallel)) {
             // invoke `collect` to trigger the intermediate operator, which will create `CompletableFuture` instances
             stream = stream.collect(Collectors.toList()).parallelStream().map((U u) -> {
+                boolean interrupted = false;
                 try {
                     return (U) ((CompletableFuture) u).get();
                 } catch (InterruptedException | ExecutionException ex) {
+                    if (ex instanceof InterruptedException) interrupted = true;
                     throw new GroovyRuntimeException(ex);
+                } finally {
+                    if (interrupted) Thread.currentThread().interrupt();
                 }
             });
         }
@@ -503,15 +521,15 @@ class QueryableCollection<T> implements Queryable<T>, Serializable {
     }
 
     private static <T, U> Queryable<Tuple2<T, U>> outerHashJoin(Queryable<? extends T> queryable1, Queryable<? extends U> queryable2, Function<? super T, ?> fieldsExtractor1, Function<? super U, ?> fieldsExtractor2) {
-        final ConcurrentObjectHolder<Map<Integer, List<U>>> hashTableHolder = new ConcurrentObjectHolder<>();
-        final Supplier<Map<Integer, List<U>>> hashTableSupplier = createHashTableSupplier(queryable2, fieldsExtractor2);
+        final ConcurrentObjectHolder<Map<Integer, List<Candidate<U>>>> hashTableHolder = new ConcurrentObjectHolder<>();
+        final Supplier<Map<Integer, List<Candidate<U>>>> hashTableSupplier = createHashTableSupplier(queryable2, fieldsExtractor2);
         Stream<Tuple2<T, U>> stream = queryable1.stream().flatMap(p -> {
             // build hash table
-            Map<Integer, List<U>> hashTable = buildHashTable(hashTableHolder, hashTableSupplier);
+            Map<Integer, List<Candidate<U>>> hashTable = buildHashTable(hashTableHolder, hashTableSupplier);
 
             // probe the hash table
             List<Tuple2<T, U>> joinResultList =
-                    probeHashTable(hashTable, (T) p, fieldsExtractor1, fieldsExtractor2).collect(Collectors.toList());
+                    probeHashTable(hashTable, (T) p, fieldsExtractor1).collect(Collectors.toList());
 
             return joinResultList.isEmpty() ? Stream.of(tuple(p, null)) : joinResultList.stream();
         });
@@ -519,20 +537,22 @@ class QueryableCollection<T> implements Queryable<T>, Serializable {
         return from(stream);
     }
 
-    private static <U> Map<Integer, List<U>> buildHashTable(final ConcurrentObjectHolder<Map<Integer, List<U>>> hashTableHolder, final Supplier<Map<Integer, List<U>>> hashTableSupplier) {
+    private static <U> Map<Integer, List<Candidate<U>>> buildHashTable(final ConcurrentObjectHolder<Map<Integer, List<Candidate<U>>>> hashTableHolder, final Supplier<Map<Integer, List<Candidate<U>>>> hashTableSupplier) {
         return hashTableHolder.getObject(hashTableSupplier);
     }
 
-    private static <T, U> Stream<Tuple2<T, U>> probeHashTable(Map<Integer, List<U>> hashTable, T p, Function<? super T, ?> fieldsExtractor1, Function<? super U, ?> fieldsExtractor2) {
+    private static <T, U> Stream<Tuple2<T, U>> probeHashTable(Map<Integer, List<Candidate<U>>> hashTable, T p, Function<? super T, ?> fieldsExtractor1) {
         final Object otherFields = fieldsExtractor1.apply(p);
-        return hashTable.entrySet().stream()
-                .filter(entry -> hash(otherFields).equals(entry.getKey()))
-                .flatMap(entry -> {
-                    List<U> candidateList = entry.getValue();
-                    return candidateList.stream()
-                            .filter(c -> Objects.equals(otherFields, fieldsExtractor2.apply(c)))
-                            .map(c -> tuple(p, c));
-                });
+        final Integer h = hash(otherFields);
+
+        List<Candidate<U>> candidateList = hashTable.get(h);
+        if (null == candidateList) return Stream.empty();
+
+        Stream<Candidate<U>> stream = candidateList.stream();
+        if (isParallel()) stream = stream.parallel();
+
+        return stream.filter(c -> Objects.equals(otherFields, c.extracted))
+                     .map(c -> tuple(p, c.original));
     }
 
     @Override

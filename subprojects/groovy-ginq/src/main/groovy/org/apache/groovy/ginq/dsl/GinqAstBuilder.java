@@ -42,6 +42,7 @@ import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.codehaus.groovy.ast.expr.Expression;
 import org.codehaus.groovy.ast.expr.MethodCallExpression;
 import org.codehaus.groovy.ast.expr.PropertyExpression;
+import org.codehaus.groovy.ast.expr.TupleExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.ExpressionStatement;
@@ -64,6 +65,7 @@ import java.util.Set;
  */
 public class GinqAstBuilder extends CodeVisitorSupport implements SyntaxErrorReportable {
     public static final String ROOT_GINQ_EXPRESSION = "__ROOT_GINQ_EXPRESSION";
+    public static final String GINQ_SELECT_DISTINCT = "__GINQ_SELECT_DISTINCT";
     private final Deque<GinqExpression> ginqExpressionStack = new ArrayDeque<>();
     private GinqExpression latestGinqExpression;
     private final SourceUnit sourceUnit;
@@ -151,11 +153,11 @@ public class GinqAstBuilder extends CodeVisitorSupport implements SyntaxErrorRep
     @Override
     public void visitMethodCallExpression(MethodCallExpression call) {
         final String methodName = call.getMethodAsString();
-        if ("over".equals(methodName)) {
+        if (KW_OVER.equals(methodName)) {
             visitingOverClause = true;
         }
         super.visitMethodCallExpression(call);
-        if ("over".equals(methodName)) {
+        if (KW_OVER.equals(methodName)) {
             visitingOverClause = false;
         }
 
@@ -329,7 +331,31 @@ public class GinqAstBuilder extends CodeVisitorSupport implements SyntaxErrorRep
         }
 
         if (KW_SELECT.equals(methodName)) {
-            SelectExpression selectExpression = new SelectExpression(call.getArguments());
+            TupleExpression tupleExpression = (TupleExpression) call.getArguments();
+            if (1 == tupleExpression.getExpressions().size()) {
+                Expression firstExpression = tupleExpression.getExpressions().get(0);
+                if (firstExpression instanceof MethodCallExpression) {
+                    MethodCallExpression mce = (MethodCallExpression) firstExpression;
+                    if (KW_DISTINCT.equals(mce.getMethodAsString())) {
+                        tupleExpression = (TupleExpression) mce.getArguments();
+                        currentGinqExpression.putNodeMetaData(GINQ_SELECT_DISTINCT, true);
+                    }
+                }
+            } else {
+                for (Expression expression : tupleExpression.getExpressions()) {
+                    if (expression instanceof MethodCallExpression) {
+                        MethodCallExpression mce = (MethodCallExpression) expression;
+                        if (KW_DISTINCT.equals(mce.getMethodAsString())) {
+                            this.collectSyntaxError(new GinqSyntaxError(
+                                    "Invalid usage of `distinct`",
+                                    mce.getLineNumber(), mce.getColumnNumber()
+                            ));
+                        }
+                    }
+                }
+            }
+
+            SelectExpression selectExpression = new SelectExpression(tupleExpression);
             selectExpression.setSourcePosition(call.getMethod());
 
             currentGinqExpression.setSelectExpression(selectExpression);
@@ -440,19 +466,26 @@ public class GinqAstBuilder extends CodeVisitorSupport implements SyntaxErrorRep
 
     private static final String __LATEST_GINQ_EXPRESSION_CLAUSE = "__latestGinqExpressionClause";
 
+    private static final String KW_WITH = "with";   // reserved keyword
     private static final String KW_FROM = "from";
-    private static final String KW_WHERE = "where";
+    private static final String KW_IN = "in";
     private static final String KW_ON = "on";
-    private static final String KW_HAVING = "having";
+    private static final String KW_WHERE = "where";
     private static final String KW_EXISTS = "exists";
     private static final String KW_GROUPBY = "groupby";
+    private static final String KW_HAVING = "having";
     private static final String KW_ORDERBY = "orderby";
     private static final String KW_LIMIT = "limit";
     private static final String KW_SELECT = "select";
+    private static final String KW_DISTINCT = "distinct";
+    private static final String KW_WITHINGROUP = "withingroup";   // reserved keyword
+    private static final String KW_OVER = "over";
+    private static final String KW_AS = "as";
     private static final String KW_SHUTDOWN = "shutdown";
     private static final Set<String> KEYWORD_SET = new HashSet<>();
     static {
-        KEYWORD_SET.addAll(Arrays.asList(KW_FROM, KW_WHERE, KW_ON, KW_HAVING, KW_EXISTS, KW_GROUPBY, KW_ORDERBY, KW_LIMIT, KW_SELECT, KW_SHUTDOWN));
+        KEYWORD_SET.addAll(Arrays.asList(KW_WITH, KW_FROM, KW_IN, KW_ON, KW_WHERE, KW_EXISTS, KW_GROUPBY, KW_HAVING, KW_ORDERBY,
+                                         KW_LIMIT, KW_SELECT, KW_DISTINCT, KW_WITHINGROUP, KW_OVER, KW_AS, KW_SHUTDOWN));
         KEYWORD_SET.addAll(JoinExpression.JOIN_NAME_LIST);
     }
 }
